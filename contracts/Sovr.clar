@@ -13,6 +13,15 @@
 (define-constant ERR_INVALID_SCORE (err u111))
 (define-constant ERR_ACHIEVEMENT_EXISTS (err u112))
 (define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u113))
+(define-constant ERR_GROUP_NOT_FOUND (err u114))
+(define-constant ERR_GROUP_EXISTS (err u115))
+(define-constant ERR_NOT_GROUP_ADMIN (err u116))
+(define-constant ERR_NOT_GROUP_MEMBER (err u117))
+(define-constant ERR_MEMBER_EXISTS (err u118))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u119))
+(define-constant ERR_PROPOSAL_EXPIRED (err u120))
+(define-constant ERR_ALREADY_VOTED (err u121))
+(define-constant ERR_INSUFFICIENT_VOTES (err u122))
 
 (define-map identities 
   { owner: principal }
@@ -58,6 +67,8 @@
 
 (define-data-var identity-counter uint u0)
 (define-data-var achievement-counter uint u0)
+(define-data-var group-counter uint u0)
+(define-data-var proposal-counter uint u0)
 
 (define-map reputation-scores
   { owner: principal }
@@ -103,6 +114,64 @@
     requirements: (string-ascii 256),
     is-active: bool,
     created-at: uint
+  }
+)
+
+;; Group/Organization management maps
+(define-map identity-groups
+  { group-id: uint }
+  {
+    name: (string-ascii 128),
+    description: (string-ascii 256),
+    admin: principal,
+    member-count: uint,
+    min-reputation: uint,
+    created-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map group-members
+  { group-id: uint, member: principal }
+  {
+    joined-at: uint,
+    role: (string-ascii 32),
+    voting-power: uint,
+    is-active: bool
+  }
+)
+
+(define-map group-attributes
+  { group-id: uint, key: (string-ascii 32) }
+  {
+    value: (string-ascii 256),
+    set-by: principal,
+    updated-at: uint
+  }
+)
+
+(define-map group-proposals
+  { proposal-id: uint }
+  {
+    group-id: uint,
+    proposer: principal,
+    proposal-type: (string-ascii 32),
+    description: (string-ascii 256),
+    target-data: (string-ascii 128),
+    votes-for: uint,
+    votes-against: uint,
+    min-votes-required: uint,
+    expires-at: uint,
+    executed: bool
+  }
+)
+
+(define-map proposal-votes
+  { proposal-id: uint, voter: principal }
+  {
+    vote: bool,
+    voting-power: uint,
+    voted-at: uint
   }
 )
 
@@ -478,3 +547,260 @@
 (define-read-only (get-achievement-count)
   (var-get achievement-counter)
 )
+
+;; Group/Organization management functions
+(define-public (create-group 
+  (name (string-ascii 128))
+  (description (string-ascii 256))
+  (min-reputation uint)
+)
+  (let
+    (
+      (group-id (+ (var-get group-counter) u1))
+      (creator tx-sender)
+      (creator-reputation (unwrap! (map-get? reputation-scores { owner: creator }) ERR_REPUTATION_NOT_FOUND))
+    )
+    ;; Require creator to have sufficient reputation to create groups
+    (asserts! (>= (get total-score creator-reputation) u300) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (is-some (map-get? identities { owner: creator })) ERR_IDENTITY_NOT_FOUND)
+    (var-set group-counter group-id)
+    (map-set identity-groups
+      { group-id: group-id }
+      {
+        name: name,
+        description: description,
+        admin: creator,
+        member-count: u1,
+        min-reputation: min-reputation,
+        created-at: stacks-block-height,
+        is-active: true
+      }
+    )
+    ;; Add creator as first member with admin role
+    (map-set group-members
+      { group-id: group-id, member: creator }
+      {
+        joined-at: stacks-block-height,
+        role: "admin",
+        voting-power: u10,
+        is-active: true
+      }
+    )
+    (ok group-id)
+  )
+)
+
+(define-public (join-group (group-id uint))
+  (let
+    (
+      (member tx-sender)
+      (group-info (unwrap! (map-get? identity-groups { group-id: group-id }) ERR_GROUP_NOT_FOUND))
+      (member-reputation (unwrap! (map-get? reputation-scores { owner: member }) ERR_REPUTATION_NOT_FOUND))
+    )
+    (asserts! (get is-active group-info) ERR_GROUP_NOT_FOUND)
+    (asserts! (is-some (map-get? identities { owner: member })) ERR_IDENTITY_NOT_FOUND)
+    (asserts! (>= (get total-score member-reputation) (get min-reputation group-info)) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (is-none (map-get? group-members { group-id: group-id, member: member })) ERR_MEMBER_EXISTS)
+    ;; Calculate voting power based on reputation
+    (let
+      (
+        (voting-power (if (> (/ (get total-score member-reputation) u100) u5) u5 (/ (get total-score member-reputation) u100)))
+      )
+      (map-set group-members
+        { group-id: group-id, member: member }
+        {
+          joined-at: stacks-block-height,
+          role: "member",
+          voting-power: voting-power,
+          is-active: true
+        }
+      )
+      ;; Update member count
+      (map-set identity-groups
+        { group-id: group-id }
+        (merge group-info { member-count: (+ (get member-count group-info) u1) })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (leave-group (group-id uint))
+  (let
+    (
+      (member tx-sender)
+      (group-info (unwrap! (map-get? identity-groups { group-id: group-id }) ERR_GROUP_NOT_FOUND))
+      (membership (unwrap! (map-get? group-members { group-id: group-id, member: member }) ERR_NOT_GROUP_MEMBER))
+    )
+    (asserts! (get is-active membership) ERR_NOT_GROUP_MEMBER)
+    ;; Admin cannot leave if there are other members
+    (asserts! (or (is-eq (get member-count group-info) u1) 
+                  (not (is-eq (get role membership) "admin"))) ERR_NOT_GROUP_ADMIN)
+    (map-set group-members
+      { group-id: group-id, member: member }
+      (merge membership { is-active: false })
+    )
+    ;; Update member count
+    (map-set identity-groups
+      { group-id: group-id }
+      (merge group-info { member-count: (- (get member-count group-info) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-group-attribute (group-id uint) (key (string-ascii 32)) (value (string-ascii 256)))
+  (let
+    (
+      (setter tx-sender)
+      (group-info (unwrap! (map-get? identity-groups { group-id: group-id }) ERR_GROUP_NOT_FOUND))
+      (membership (unwrap! (map-get? group-members { group-id: group-id, member: setter }) ERR_NOT_GROUP_MEMBER))
+    )
+    (asserts! (get is-active group-info) ERR_GROUP_NOT_FOUND)
+    (asserts! (get is-active membership) ERR_NOT_GROUP_MEMBER)
+    ;; Only admin or members with voting power >= 3 can set attributes
+    (asserts! (or (is-eq (get role membership) "admin") 
+                  (>= (get voting-power membership) u3)) ERR_NOT_GROUP_ADMIN)
+    (map-set group-attributes
+      { group-id: group-id, key: key }
+      {
+        value: value,
+        set-by: setter,
+        updated-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-group-proposal 
+  (group-id uint)
+  (proposal-type (string-ascii 32))
+  (description (string-ascii 256))
+  (target-data (string-ascii 128))
+)
+  (let
+    (
+      (proposal-id (+ (var-get proposal-counter) u1))
+      (proposer tx-sender)
+      (group-info (unwrap! (map-get? identity-groups { group-id: group-id }) ERR_GROUP_NOT_FOUND))
+      (membership (unwrap! (map-get? group-members { group-id: group-id, member: proposer }) ERR_NOT_GROUP_MEMBER))
+      (min-votes (if (> (/ (get member-count group-info) u2) u1) (/ (get member-count group-info) u2) u1))
+    )
+    (asserts! (get is-active group-info) ERR_GROUP_NOT_FOUND)
+    (asserts! (get is-active membership) ERR_NOT_GROUP_MEMBER)
+    (var-set proposal-counter proposal-id)
+    (map-set group-proposals
+      { proposal-id: proposal-id }
+      {
+        group-id: group-id,
+        proposer: proposer,
+        proposal-type: proposal-type,
+        description: description,
+        target-data: target-data,
+        votes-for: u0,
+        votes-against: u0,
+        min-votes-required: min-votes,
+        expires-at: (+ stacks-block-height u1440),
+        executed: false
+      }
+    )
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+  (let
+    (
+      (voter tx-sender)
+      (proposal (unwrap! (map-get? group-proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (membership (unwrap! (map-get? group-members { group-id: (get group-id proposal), member: voter }) ERR_NOT_GROUP_MEMBER))
+    )
+    (asserts! (< stacks-block-height (get expires-at proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (get is-active membership) ERR_NOT_GROUP_MEMBER)
+    (asserts! (is-none (map-get? proposal-votes { proposal-id: proposal-id, voter: voter })) ERR_ALREADY_VOTED)
+    (let
+      (
+        (voting-power (get voting-power membership))
+        (new-votes-for (if vote (+ (get votes-for proposal) voting-power) (get votes-for proposal)))
+        (new-votes-against (if vote (get votes-against proposal) (+ (get votes-against proposal) voting-power)))
+      )
+      (map-set proposal-votes
+        { proposal-id: proposal-id, voter: voter }
+        {
+          vote: vote,
+          voting-power: voting-power,
+          voted-at: stacks-block-height
+        }
+      )
+      (map-set group-proposals
+        { proposal-id: proposal-id }
+        (merge proposal { votes-for: new-votes-for, votes-against: new-votes-against })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let
+    (
+      (executor tx-sender)
+      (proposal (unwrap! (map-get? group-proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (group-info (unwrap! (map-get? identity-groups { group-id: (get group-id proposal) }) ERR_GROUP_NOT_FOUND))
+      (membership (unwrap! (map-get? group-members { group-id: (get group-id proposal), member: executor }) ERR_NOT_GROUP_MEMBER))
+    )
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (get is-active membership) ERR_NOT_GROUP_MEMBER)
+    (asserts! (>= (get votes-for proposal) (get min-votes-required proposal)) ERR_INSUFFICIENT_VOTES)
+    (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR_INSUFFICIENT_VOTES)
+    ;; Mark proposal as executed
+    (map-set group-proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    ;; Execute based on proposal type (simplified implementation)
+    (if (is-eq (get proposal-type proposal) "attribute")
+        (begin
+          (try! (set-group-attribute (get group-id proposal) "decision" (get target-data proposal)))
+          (ok true))
+        (ok true))
+  )
+)
+
+;; Read-only functions for groups
+(define-read-only (get-group (group-id uint))
+  (map-get? identity-groups { group-id: group-id })
+)
+
+(define-read-only (get-group-member (group-id uint) (member principal))
+  (map-get? group-members { group-id: group-id, member: member })
+)
+
+(define-read-only (get-group-attribute (group-id uint) (key (string-ascii 32)))
+  (map-get? group-attributes { group-id: group-id, key: key })
+)
+
+(define-read-only (get-group-proposal (proposal-id uint))
+  (map-get? group-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-proposal-vote (proposal-id uint) (voter principal))
+  (map-get? proposal-votes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (is-group-member (group-id uint) (member principal))
+  (match (map-get? group-members { group-id: group-id, member: member })
+    membership (get is-active membership)
+    false
+  )
+)
+
+(define-read-only (get-group-count)
+  (var-get group-counter)
+)
+
+(define-read-only (get-proposal-count)
+  (var-get proposal-counter)
+)
+
